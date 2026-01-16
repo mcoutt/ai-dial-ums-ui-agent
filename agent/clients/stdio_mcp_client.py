@@ -25,7 +25,10 @@ class StdioMCPClient:
         # 1. Create instance `cls(docker_image)`
         # 2. Connect to MCP Server (method `connect`)
         # 3. Return created instance
-        raise NotImplementedError()
+        logger.info("Creating StdioMCPClient", extra={"docker_image": docker_image})
+        instance = cls(docker_image)
+        await instance.connect()
+        return instance
 
     async def connect(self):
         """Connect to MCP server via Docker"""
@@ -39,7 +42,29 @@ class StdioMCPClient:
         # 5. Set `self.session: ClientSession` as `await self._session_context.__aenter__()`
         # 6. Call session initialization (initialize method) and assign results to `init_result` variable (initialize is async)
         # 7. Log the `init_result` to see in logs MCP server capabilities
-        raise NotImplementedError()
+        server_params = StdioServerParameters(
+            command="docker",
+            args=["run", "--rm", "-i", self.docker_image]
+        )
+
+        logger.info("Starting Docker container for MCP", extra={"docker_image": self.docker_image})
+        self._stdio_context = stdio_client(server_params)
+
+        read_stream, write_stream = await self._stdio_context.__aenter__()
+
+        self._session_context = ClientSession(read_stream, write_stream)
+        self.session = await self._session_context.__aenter__()
+
+        logger.debug("Initializing MCP session", extra={"docker_image": self.docker_image})
+        init_result = await self.session.initialize()
+
+        logger.info(
+            "MCP session initialized via stdio",
+            extra={
+                "docker_image": self.docker_image,
+                "capabilities": init_result.model_dump()
+            }
+        )
 
     async def get_tools(self) -> list[dict[str, Any]]:
         """Get available tools from MCP server"""
@@ -50,7 +75,35 @@ class StdioMCPClient:
         #    tool format https://dialx.ai/dial_api#operation/sendChatCompletionRequest (see tools param)
         # 4. Log retrieved tools
         # 5. Return tools dicts list
-        raise NotImplementedError()
+        if not self.session:
+            logger.error("Attempted to get tools without active session", extra={"docker_image": self.docker_image})
+            raise RuntimeError("MCP client not connected. Call connect() first.")
+
+        logger.debug("Fetching tools from MCP server", extra={"docker_image": self.docker_image})
+        tools_result = await self.session.list_tools()
+
+        dial_tools = []
+        for tool in tools_result.tools:
+            dial_tool = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema
+                }
+            }
+            dial_tools.append(dial_tool)
+
+        logger.info(
+            "Retrieved tools from MCP server",
+            extra={
+                "docker_image": self.docker_image,
+                "tool_count": len(dial_tools),
+                "tool_names": [tool["function"]["name"] for tool in dial_tools]
+            }
+        )
+
+        return dial_tools
 
     async def call_tool(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
         """Call a specific tool on the MCP server"""
@@ -61,4 +114,41 @@ class StdioMCPClient:
         # 4. Get tool execution content
         # 5. Get first element from content (it is array with `ContentBlock`)
         # 6. Check if element is instance of TextContent, if yes then return its text, otherwise return retrieved content
-        raise NotImplementedError()
+        if not self.session:
+            logger.error(
+                "Attempted to call tool without active session",
+                extra={"docker_image": self.docker_image, "tool_name": tool_name}
+            )
+            raise RuntimeError("MCP client not connected. Call connect() first.")
+
+        logger.info(
+            "Calling MCP tool via stdio",
+            extra={
+                "docker_image": self.docker_image,
+                "tool_name": tool_name,
+                "tool_args": tool_args
+            }
+        )
+
+        tool_result: CallToolResult = await self.session.call_tool(tool_name, tool_args)
+
+        if not tool_result.content:
+            logger.warning(
+                "Tool returned no content",
+                extra={"tool_name": tool_name, "docker_image": self.docker_image}
+            )
+            return "No content returned from tool"
+
+        content = tool_result.content[0]
+        logger.debug(
+            "MCP tool result received",
+            extra={
+                "tool_name": tool_name,
+                "content": content
+            }
+        )
+
+        if isinstance(content, TextContent):
+            return content.text
+
+        return str(content)
